@@ -191,13 +191,20 @@ class OnnxEncoder(nn.Module):
         self.chunk_size = encoder.chunk_size[0]
         self.left_context_len = encoder.left_context_frames[0]
 
+        # The encoder_embed subsample features (T - 7) // 2
+        # The ConvNeXt module needs (7 - 1) // 2 = 3 frames of right padding after subsampling
+        self.pad_length = 7 + 2 * 3
+
+        self.encoder = encoder
+        self.encoder_embed = encoder_embed
+
     def forward(
         self,
         x: torch.Tensor,
         states: List[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        T = self.chunk_size * 2 + self.pad_length
         N = x.size(0)
-        T = x.size(1)
         x_lens = torch.tensor([T] * N, device=x.device)
         left_context_len = self.left_context_len
 
@@ -268,7 +275,7 @@ class OnnxEncoder(nn.Module):
         processed_lens = torch.zeros(batch_size, dtype=torch.int32, device=device)
         states.append(processed_lens)
 
-        return states 
+        return states
 
 
 class OnnxDecoder(nn.Module):
@@ -335,7 +342,7 @@ def export_encoder_model_onnx(
     # The ConvNeXt module needs (7 - 1) // 2 = 3 frames of right padding after subsampling
     pad_length = 7 + 2 * 3
     T = decode_chunk_len + pad_length
-    
+
     x = torch.rand(1, T, 80, dtype=torch.float32)
     init_state = encoder_model.get_init_states()
     num_encoders = len(encoder_model.encoder.encoder_dim)
@@ -347,13 +354,57 @@ def export_encoder_model_onnx(
 
     outputs = {}
     output_names = ["encoder_out"]
-    def build_inputs_outputs(tensors, name, N):
-        for i, s in enumerate(tensors):
-            logging.info(f"{name}_{i}.shape: {s.shape}")
-            inputs[f"{name}_{i}"] = {N: "N"}
-            outputs[f"new_{name}_{i}"] = {N: "N"}
-            input_names.append(f"{name}_{i}")
-            output_names.append(f"new_{name}_{i}")
+    def build_inputs_outputs(tensors, i):
+        assert len(tensors) == 6, len(tensors)
+
+        # (downsample_left, batch_size, key_dim)
+        name = f'cached_key_{i}'
+        logging.info(f"{name}.shape: {tensors[0].shape}")
+        inputs[f"{name}"] = {1: "N"}
+        outputs[f"new_{name}"] = {1: "N"}
+        input_names.append(f"{name}")
+        output_names.append(f"new_{name}")
+
+        # (1, batch_size, downsample_left, nonlin_attn_head_dim)
+        name = f'cached_nonlin_attn_{i}'
+        logging.info(f"{name}.shape: {tensors[1].shape}")
+        inputs[f"{name}"] = {1: "N"}
+        outputs[f"new_{name}"] = {1: "N"}
+        input_names.append(f"{name}")
+        output_names.append(f"new_{name}")
+
+        # (downsample_left, batch_size, value_dim)
+        name = f'cached_val1_{i}'
+        logging.info(f"{name}.shape: {tensors[2].shape}")
+        inputs[f"{name}"] = {1: "N"}
+        outputs[f"new_{name}"] = {1: "N"}
+        input_names.append(f"{name}")
+        output_names.append(f"new_{name}")
+
+        # (downsample_left, batch_size, value_dim)
+        name = f'cached_val2_{i}'
+        logging.info(f"{name}.shape: {tensors[3].shape}")
+        inputs[f"{name}"] = {1: "N"}
+        outputs[f"new_{name}"] = {1: "N"}
+        input_names.append(f"{name}")
+        output_names.append(f"new_{name}")
+
+        # (batch_size, embed_dim, conv_left_pad)
+        name = f'cached_conv1_{i}'
+        logging.info(f"{name}.shape: {tensors[4].shape}")
+        inputs[f"{name}"] = {0: "N"}
+        outputs[f"new_{name}"] = {0: "N"}
+        input_names.append(f"{name}")
+        output_names.append(f"new_{name}")
+
+        # (batch_size, embed_dim, conv_left_pad)
+        name = f'cached_conv2_{i}'
+        logging.info(f"{name}.shape: {tensors[5].shape}")
+        inputs[f"{name}"] = {0: "N"}
+        outputs[f"new_{name}"] = {0: "N"}
+        input_names.append(f"{name}")
+        output_names.append(f"new_{name}")
+
 
     num_encoder_layers = ",".join(map(str, encoder_model.encoder.num_encoder_layers))
     encoder_dims = ",".join(map(str, encoder_model.encoder.encoder_dim))
@@ -376,37 +427,34 @@ def export_encoder_model_onnx(
     }
     logging.info(f"meta_data: {meta_data}")
 
-    # (num_encoder_layers, left_context_len, 1, key_dim)
-    cached_key = init_state[0:-2:6]
+    for i in range(len(init_state[:-2]) // 6):
+        build_inputs_outputs(init_state[i*6:(i+1)*6], i)
 
-    # (num_encoder_layers, 1, 1, left_context_len, nonlin_attn_head_dim)
-    cached_nonlin_attn = init_state[1:-2:6]
 
-    # (num_encoder_layers, left_context_len, 1, attention_dim//2)
-    cached_val1 = init_state[2:-2:6]
+    # (batch_size, channels, left_pad, freq)
+    embed_states = init_state[-2]
+    name = f'embed_states'
+    logging.info(f"{name}.shape: {embed_states.shape}")
+    inputs[f"{name}"] = {0: "N"}
+    outputs[f"new_{name}"] = {0: "N"}
+    input_names.append(f"{name}")
+    output_names.append(f"new_{name}")
 
-    # (num_encoder_layers, left_context_len, 1, attention_dim//2)
-    cached_val2 = init_state[3:-2:6]
-
-    # (num_encoder_layers, 1, encoder_dim, cnn_module_kernel-1)
-    cached_conv1 = init_state[4:-2:6]
-
-    # (num_encoder_layers, 1, encoder_dim, cnn_module_kernel-1)
-    cached_conv2 = init_state[5:-2:6]
-
-    build_inputs_outputs(cached_key, "cached_key", 2)
-    build_inputs_outputs(cached_nonlin_attn, "cached_nonlin_attn", 2)
-    build_inputs_outputs(cached_val1, "cached_val1", 2)
-    build_inputs_outputs(cached_val2, "cached_val2", 2)
-    build_inputs_outputs(cached_conv1, "cached_conv1", 1)
-    build_inputs_outputs(cached_conv2, "cached_conv2", 1)
+    # (batch_size,)
+    processed_lens = init_state[-1]
+    name = f'processed_lens'
+    logging.info(f"{name}.shape: {processed_lens.shape}")
+    inputs[f"{name}"] = {0: "N"}
+    outputs[f"new_{name}"] = {0: "N"}
+    input_names.append(f"{name}")
+    output_names.append(f"new_{name}")
 
     logging.info(inputs)
     logging.info(outputs)
     logging.info(input_names)
     logging.info(output_names)
 
-    encoder_model = torch.jit.trace(encoder_model, (x, init_state))
+    #  encoder_model = torch.jit.trace(encoder_model, (x, init_state))
 
     torch.onnx.export(
         encoder_model,
@@ -635,7 +683,7 @@ def main():
     model.to("cpu")
     model.eval()
 
-    convert_scaled_to_non_scaled(model, inplace=True, is_onnx=True)
+    convert_scaled_to_non_scaled(model, inplace=True)
 
     encoder = OnnxEncoder(
         encoder=model.encoder,
@@ -676,6 +724,7 @@ def main():
         opset_version=opset_version,
     )
     logging.info(f"Exported encoder to {encoder_filename}")
+    return
 
     logging.info("Exporting decoder")
     decoder_filename = params.exp_dir / f"decoder-{suffix}.onnx"
